@@ -1,0 +1,181 @@
+#!/bin/bash
+set -e
+
+if [ $# -ne 1 ]; then
+  echo "No config file given!"
+  exit 1
+fi
+
+if [ ! -e "${1}" ]; then
+  echo "The given config file does not exist!"
+  exit 1
+fi
+LXDH_CONFIG="${1}"
+
+LXDH_VG="vg-lxd"
+LXDH_LV="lv-lxd"
+
+function firstNet {
+  for net in /sys/class/net/eno*; do
+    [ -e "$net" ] || continue
+    echo $(basename "${net}")
+    return
+  done
+
+  for net in /sys/class/net/ens*; do
+    [ -e "$net" ] || continue
+    echo $(basename "${net}")
+    return
+  done
+
+  for net in /sys/class/net/enp*; do
+    [ -e "$net" ] || continue
+    echo $(basename "${net}")
+    return
+  done
+
+  for net in /sys/class/net/eth*; do
+    [ -e "$net" ] || continue
+    echo $(basename "${net}")
+    return
+  done
+
+  exit 1
+}
+LXDH_NET_IF=$(firstNet)
+
+source ${LXDH_CONFIG}
+
+if [ -z ${LXDH_DISK1} ]; then
+  echo "LXDH_DISK1: not configured"
+  exit 1
+fi
+LXDH_DISK1=$(realpath "${LXDH_DISK1}")
+
+if [ -z ${LXDH_DISK2} ]; then
+  echo "LXDH_DISK2: not configured"
+  exit 1
+fi
+LXDH_DISK2=$(realpath "${LXDH_DISK2}")
+
+if [ ! -b "${LXDH_DISK1}" ]; then
+  echo "LXDH_DISK1: ${LXDH_DISK1} is not a block device!"
+  exit 1
+fi
+if [ ! -b "${LXDH_DISK2}" ]; then
+  echo "LXDH_DISK2: ${LXDH_DISK2} is not a block device!"
+  exit 1
+fi
+
+if [ "${LXDH_DISK1}" -ef "${LXDH_DISK2}" ]
+then
+  echo "LXDH_DISK1/2: you must specify diffrent block devices!"
+  exit 1
+fi
+
+
+### Eventuell bestehendes Logical Volume entfernen
+if [ -e "/dev/${LXDH_VG}/${LXDH_LV}" ]; then
+  wipefs -a "/dev/${LXDH_VG}/${LXDH_LV}"
+  lvremove --force "${LXDH_VG}/${LXDH_LV}"
+  vgremove --force "${LXDH_VG}"
+fi
+
+
+### LXD-Festplatten partitionieren
+for LXDH_DISK in ${LXDH_DISK1} ${LXDH_DISK2}
+do
+  wipefs -a "${LXDH_DISK}"
+  sfdisk --no-reread -w always -W always --force "${LXDH_DISK}" <<EOT
+label: gpt
+unit: sectors
+
+start=2048, type=E6D6D379-F507-44C2-A23C-238F2A3DF928
+EOT
+done
+
+
+### Volume Group und Logical Volume anlegen
+vgcreate "${LXDH_VG}" "${LXDH_DISK1}1" "${LXDH_DISK2}1"
+lvcreate -m1 -L128G -n "${LXDH_LV}" "${LXDH_VG}"
+
+
+### BTRFS Filesystem anlegen und mounten
+wipefs -a "/dev/${LXDH_VG}/${LXDH_LV}"
+mkfs.btrfs -f "/dev/${LXDH_VG}/${LXDH_LV}"
+
+mount "/dev/${LXDH_VG}/${LXDH_LV}" /mnt/
+btrfs subvolume create /mnt/@lxd
+
+mkdir /var/lib/lxd
+mount /dev/${LXDH_VG}/${LXDH_LV} /var/lib/lxd -o subvol=@lxd
+
+cat <<EOT >> /etc/fstab
+/dev/${LXDH_VG}/${LXDH_LV}  /var/lib/lxd  btrfs  defaults,subvol=@lxd  0  1
+EOT
+
+
+### Netplan einrichten
+cat <<EOT > /etc/netplan/config.yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${LXDH_NET_IF}:
+      dhcp4:  no
+  bridges:
+    lxdbr0:
+      addresses:
+        - ${LXDH_NET_AD}
+      dhcp4: no
+      interfaces:
+        - ${LXDH_NET_IF}
+      gateway4: ${LXDH_NET_GW}
+      nameservers:
+        search: [ ${LXDH_NET_SD} ]
+        addresses: [ ${LXDH_NET_NS} ]
+
+EOT
+
+netplan generate
+netplan apply
+sleep 30
+
+
+### LXD einrichten
+apt install -y lxd lxd-client
+
+echo -n "lxd trust password: "
+read -s LXDH_PASSWD
+
+lxd init --preseed <<EOT
+config:
+  core.https_address: '[::]:8443'
+  core.trust_password: ${LXDH_PASSWD}
+networks: []
+storage_pools:
+- config:
+    source: /var/lib/lxd/storage-pools/default
+  description: ""
+  name: default
+  driver: btrfs
+profiles:
+- config: {}
+  description: ""
+  devices:
+    eth0:
+      name: eth0
+      nictype: macvlan
+      parent: lxdbr0
+      type: nic
+    root:
+      path: /
+      pool: default
+      type: disk
+  name: default
+cluster: null
+EOT
+
+### Snapshot erstellen
+btrfs subvolume snapshot / /snapshot/@-`date -u +%Y%m%d%H%M%S`-lxdh-setup
+

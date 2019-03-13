@@ -1,0 +1,8 @@
+
+LXDH_DISK1="/dev/sdc"
+LXDH_DISK2="/dev/sdd"
+
+LXDH_NET_AD="192.168.0.100/16"
+LXDH_NET_GW="192.168.0.1"
+LXDH_NET_NS="192.168.0.1"
+LXDH_NET_SD="local"
