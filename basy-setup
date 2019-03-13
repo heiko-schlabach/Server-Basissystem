@@ -1,0 +1,229 @@
+#!/bin/bash
+set -e
+
+BASY_VG="vg-sys"
+BASY_LV="lv-sys"
+
+source /basy-config
+
+BASY_DISK1=$(realpath "${BASY_DISK1}")
+BASY_DISK2=$(realpath "${BASY_DISK2}")
+
+function firstDiskId {
+  for disk in /dev/disk/by-id/*; do
+    [ -e "${disk}" ] || continue
+    if [ "$(realpath ${disk})" == "${1}" ]; then
+      echo ${disk}
+      return
+    fi
+  done
+
+  echo "${1}"
+}
+BASY_DISK1ID=$(firstDiskId "${BASY_DISK1}")
+BASY_DISK2ID=$(firstDiskId "${BASY_DISK2}")
+
+function firstNet {
+  for net in /sys/class/net/eno*; do
+    [ -e "$net" ] || continue
+    echo $(basename "${net}")
+    return
+  done
+
+  for net in /sys/class/net/ens*; do
+    [ -e "$net" ] || continue
+    echo $(basename "${net}")
+    return
+  done
+
+  for net in /sys/class/net/enp*; do
+    [ -e "$net" ] || continue
+    echo $(basename "${net}")
+    return
+  done
+
+  for net in /sys/class/net/eth*; do
+    [ -e "$net" ] || continue
+    echo $(basename "${net}")
+    return
+  done
+
+  exit 1
+}
+BASY_FIRSTNET=$(firstNet)
+
+
+## /etc/fstab anlegen
+cat <<EOT > /etc/fstab
+/dev/${BASY_VG}/${BASY_LV}  /          btrfs  defaults,subvol=@          0  1
+/dev/${BASY_VG}/${BASY_LV}  /home      btrfs  defaults,subvol=@home      0  1
+/dev/${BASY_VG}/${BASY_LV}  /snapshot  btrfs  defaults,subvol=@snapshot  0  1
+EOT
+
+
+## APT konfigurieren
+cat <<EOT > /etc/apt/sources.list
+deb http://archive.ubuntu.com/ubuntu bionic main
+deb-src http://archive.ubuntu.com/ubuntu bionic main
+deb http://archive.ubuntu.com/ubuntu bionic-updates main
+deb-src http://archive.ubuntu.com/ubuntu bionic-updates main
+deb http://security.ubuntu.com/ubuntu bionic-security main
+deb-src http://security.ubuntu.com/ubuntu bionic-security main
+
+deb http://archive.ubuntu.com/ubuntu bionic universe
+deb-src http://archive.ubuntu.com/ubuntu bionic universe
+deb http://archive.ubuntu.com/ubuntu bionic-updates universe
+deb-src http://archive.ubuntu.com/ubuntu bionic-updates universe
+deb http://security.ubuntu.com/ubuntu bionic-security universe
+deb-src http://security.ubuntu.com/ubuntu bionic-security universe
+EOT
+
+## System aktualisieren
+debconf-set-selections <<EOT
+console-setup  console-setup/charmap47  select  UTF-8
+EOT
+
+apt update
+apt upgrade -y
+
+
+## Language Pack installieren
+apt install -y language-pack-de
+update-locale LANG=de_DE.UTF-8
+
+
+## Tastaturlayout einrichten
+debconf-set-selections <<EOT
+keyboard-configuration  keyboard-configuration/modelcode   string  pc105
+keyboard-configuration  keyboard-configuration/model       select  Generische PC-Tastatur mit 105 Tasten (Intl)
+keyboard-configuration  keyboard-configuration/variant     select  Deutsch
+keyboard-configuration  keyboard-configuration/layoutcode  string  de
+keyboard-configuration  keyboard-configuration/layout      select  Deutsch
+keyboard-configuration  keyboard-configuration/compose     select  No compose key
+keyboard-configuration  keyboard-configuration/altgr       select  The default for the keyboard layout
+EOT
+
+cat <<EOT > /etc/default/keyboard
+# KEYBOARD CONFIGURATION FILE
+
+# Consult the keyboard(5) manual page.
+
+XKBMODEL="pc105"
+XKBLAYOUT="de"
+XKBVARIANT=""
+XKBOPTIONS=""
+
+BACKSPACE="guess"
+EOT
+
+
+## tools installieren
+apt install -y htop lvm2 nano tmux iotop rsync btrfs-progs
+
+
+## Kernel und Grub einrichten
+debconf-set-selections <<EOT
+grub-pc  grub2/linux_cmdline_default  string
+grub-pc  grub-pc/install_devices      multiselect  ${BASY_DISK1ID}, ${BASY_DISK2ID}
+EOT
+
+DEBIAN_FRONTEND=noninteractive apt install -y linux-image-generic
+
+echo raid1 >> /etc/initramfs-tools/modules
+update-initramfs -u
+
+
+## Passwort setzen
+passwd
+
+
+## Netplan einrichten
+cat <<EOT > /etc/netplan/config.yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${BASY_FIRSTNET}:
+      dhcp4: yes
+EOT
+
+netplan generate
+
+
+## SSH einrichten
+apt install -y ssh
+sed -i "s/#PermitRootLogin prohibit-password/PermitRootLogin yes \#prohibit-password/g" /etc/ssh/sshd_config
+
+
+## APT Autoupdate
+apt install -y unattended-upgrades
+
+
+## MTA einrichten
+apt install -y msmtp-mta
+
+cat <<EOT > /etc/msmtprc
+defaults
+auth           on
+tls            on
+tls_starttls   on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        /var/log/msmtp.log
+
+# Default Account
+account        default
+aliases        /etc/aliases
+host           ${BASY_MAILHOST}
+port           587
+from           ${BASY_MAILFROM}
+user           ${BASY_MAILUSER}
+password       ${BASY_MAILPASS}
+EOT
+
+cat <<EOT > /etc/aliases
+default: ${BASY_MAILALIAS}
+EOT
+
+
+## smartmontools einrichten
+apt install -y smartmontools
+
+cat <<EOT > /root/smartdmail.sh
+#!/bin/bash -e
+echo -e "Subject:\${SMARTD_SUBJECT}\n\n\${SMARTD_FULLMESSAGE}" | sendmail root
+EOT
+
+chmod u+x /root/smartdmail.sh
+
+mv /etc/smartd.conf /etc/smartd.conf.bak
+
+cat <<EOT > /etc/smartd.conf
+DEVICESCAN -d removable -m root -M exec /root/smartdmail.sh -s S/../../[1-6]/02 -s L/../../7/02
+EOT
+
+
+## LVM2 Activation
+cat <<EOT > /etc/systemd/system/lvm2-activation.service
+[Unit]
+Description=Activation of LVM2 logical volumes
+DefaultDependencies=no
+After=cryptsetup.target
+Before=local-fs.target shutdown.target
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+Environment=LVM_SUPRESS_LOCKING_FAILURE_MESSAGES=1
+ExecStart=/sbin/lvm vgchange -aay --ignorelockingfailure --ignoremonitoring --poll n
+
+[Install]
+WantedBy=local-fs.target
+EOT
+
+systemctl enable lvm2-activation.service
+
+
+## LVM2 Monitoring
+cat <<EOT > /etc/cron.d/lvmcheck
+*/15 * * * *  root  /sbin/vgck 2>&1 | grep -v lvmetad
+EOT

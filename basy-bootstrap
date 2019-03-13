@@ -1,0 +1,121 @@
+#!/bin/bash
+set -e
+
+if [ $# -ne 1 ]; then
+  echo "No config file given!"
+  exit 1
+fi
+
+if [ ! -e "${1}" ]; then
+  echo "The given config file does not exist!"
+  exit 1
+fi
+BASY_CONFIG="${1}"
+
+BASY_VG="vg-sys"
+BASY_LV="lv-sys"
+
+source ${BASY_CONFIG}
+
+if [ -z ${BASY_DISK1} ]; then
+  echo "BASY_DISK1: not configured"
+  exit 1
+fi
+BASY_DISK1=$(realpath "${BASY_DISK1}")
+
+if [ -z ${BASY_DISK2} ]; then
+  echo "BASY_DISK2: not configured"
+  exit 1
+fi
+BASY_DISK2=$(realpath "${BASY_DISK2}")
+
+if [ ! -b "${BASY_DISK1}" ]; then
+  echo "BASY_DISK1: ${BASY_DISK1} is not a block device!"
+  exit 1
+fi
+if [ ! -b "${BASY_DISK2}" ]; then
+  echo "BASY_DISK2: ${BASY_DISK2} is not a block device!"
+  exit 1
+fi
+
+if [ "${BASY_DISK1}" -ef "${BASY_DISK2}" ]
+then
+  echo "BASY_DISK1/2: you must specify diffrent block devices!"
+  exit 1
+fi
+
+
+### Eventuell bestehendes Logical Volume entfernen
+if [ -e "/dev/${BASY_VG}/${BASY_LV}" ]; then
+  wipefs -a "/dev/${BASY_VG}/${BASY_LV}"
+  lvremove --force "${BASY_VG}/${BASY_LV}"
+  vgremove --force "${BASY_VG}"
+fi
+
+
+### Systemfestplatten partitionieren
+for BASY_DISK in ${BASY_DISK1} ${BASY_DISK2}
+do
+  wipefs -a "${BASY_DISK}"
+  sfdisk --no-reread -w always -W always --force "${BASY_DISK}" <<EOT
+label: gpt
+unit: sectors
+
+start=2048, size=2048, type=21686148-6449-6E6F-744E-656564454649
+start=4096, type=E6D6D379-F507-44C2-A23C-238F2A3DF928
+EOT
+done
+
+
+### Volume Group und Logical Volume anlegen
+vgcreate "${BASY_VG}" "${BASY_DISK1}2" "${BASY_DISK2}2"
+lvcreate -m1 -L8G -n "${BASY_LV}" "${BASY_VG}"
+
+
+### BTRFS Filesystem anlegen und mounten
+wipefs -a "/dev/${BASY_VG}/${BASY_LV}"
+mkfs.btrfs -f "/dev/${BASY_VG}/${BASY_LV}"
+
+mount "/dev/${BASY_VG}/${BASY_LV}" /mnt/
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@snapshot
+
+
+### Ubuntu Basissystem installieren
+apt update
+apt install -y debootstrap
+debootstrap --arch amd64 bionic /mnt/@
+
+btrfs subvolume snapshot /mnt/@ /mnt/@snapshot/@-`date -u +%Y%m%d%H%M%S`-basy-bootstrap
+umount /mnt
+
+
+### In das Basissystem wechseln
+mount "/dev/${BASY_VG}/${BASY_LV}" /mnt/ -o subvol=@
+mount "/dev/${BASY_VG}/${BASY_LV}" /mnt/home -o subvol=@home
+
+mkdir /mnt/snapshot
+mount "/dev/${BASY_VG}/${BASY_LV}" /mnt/snapshot -o subvol=@snapshot
+
+cp -L /etc/resolv.conf /mnt/etc/
+
+mount -o rbind /dev /mnt/dev
+mount --make-rslave /mnt/dev
+mount -o rbind /sys /mnt/sys
+mount --make-rslave /mnt/sys
+mount -t proc /proc /mnt/proc
+
+
+### basy-setup
+cp basy-setup /mnt/basy-setup
+cp ${BASY_CONFIG} /mnt/basy-config
+
+chmod u+x /mnt/basy-setup
+chroot /mnt /basy-setup
+
+rm /mnt/basy-config
+rm /mnt/basy-setup
+
+btrfs subvolume snapshot /mnt /mnt/snapshot/@-`date -u +%Y%m%d%H%M%S`-basy-setup
+
