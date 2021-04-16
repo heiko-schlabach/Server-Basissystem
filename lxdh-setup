@@ -73,7 +73,6 @@ then
   exit 1
 fi
 
-
 ### Eventuell bestehendes Logical Volume entfernen
 if [ -e "/dev/${LXDH_VG}/${LXDH_LV}" ]; then
   wipefs -a "/dev/${LXDH_VG}/${LXDH_LV}"
@@ -107,11 +106,14 @@ mkfs.btrfs -f "/dev/${LXDH_VG}/${LXDH_LV}"
 mount "/dev/${LXDH_VG}/${LXDH_LV}" /mnt/
 btrfs subvolume create /mnt/@lxd
 
-mkdir /var/lib/lxd
-mount /dev/${LXDH_VG}/${LXDH_LV} /var/lib/lxd -o subvol=@lxd
+mkdir -p /var/snap/lxd
+mount /dev/${LXDH_VG}/${LXDH_LV} /var/snap/lxd -o subvol=@lxd
+
+#mkdir -p /var/lib/lxd
+#mount /dev/${LXDH_VG}/${LXDH_LV} /var/lib/lxd -o subvol=@lxd
 
 cat <<EOT >> /etc/fstab
-/dev/${LXDH_VG}/${LXDH_LV}  /var/lib/lxd  btrfs  defaults,subvol=@lxd  0  1
+/dev/${LXDH_VG}/${LXDH_LV}  /var/snap/lxd  btrfs  defaults,subvol=@lxd  0  1
 EOT
 
 
@@ -165,7 +167,7 @@ profiles:
   devices:
     eth0:
       name: eth0
-      nictype: macvlan
+      nictype: bridge
       parent: lxdbr0
       type: nic
     root:
