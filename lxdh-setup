@@ -167,7 +167,7 @@ profiles:
   devices:
     eth0:
       name: eth0
-      nictype: bridge
+      nictype: bridged
       parent: lxdbr0
       type: nic
     root:
