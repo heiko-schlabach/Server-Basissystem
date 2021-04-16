@@ -74,6 +74,8 @@ lvcreate -m1 -L8G -n "${BASY_LV}" "${BASY_VG}"
 
 ### BTRFS Filesystem anlegen und mounten
 wipefs -a "/dev/${BASY_VG}/${BASY_LV}"
+# overwrite first 10MBs with Zeros to be sure everything is gone
+dd if=/dev/zero of="/dev/${BASY_VG}/${BASY_LV}" bs=1M count=10
 mkfs.btrfs -f "/dev/${BASY_VG}/${BASY_LV}"
 
 mount "/dev/${BASY_VG}/${BASY_LV}" /mnt/
@@ -85,7 +87,7 @@ btrfs subvolume create /mnt/@snapshot
 ### Ubuntu Basissystem installieren
 apt update
 apt install -y debootstrap
-debootstrap --arch amd64 bionic /mnt/@
+debootstrap --arch amd64 focal /mnt/@
 
 btrfs subvolume snapshot /mnt/@ /mnt/@snapshot/@-`date -u +%Y%m%d%H%M%S`-basy-bootstrap
 umount /mnt
